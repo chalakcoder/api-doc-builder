@@ -11,6 +11,11 @@ psycopg2-binary==2.9.9  # PostgreSQL adapter (optional for SQLite)
 pydantic==2.5.0
 pydantic-settings==2.1.0
 
+# Specification validation
+jsonschema==4.20.0
+openapi-spec-validator==0.7.1
+graphql-core==3.2.3
+
 # Async job processing
 celery==5.3.4
 redis==5.0.1

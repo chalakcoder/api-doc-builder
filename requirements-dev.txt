@@ -13,6 +13,11 @@ pyyaml==6.0.1
 markdown==3.5.1
 pygments==2.17.2
 
+# Specification validation
+jsonschema==4.20.0
+openapi-spec-validator==0.7.1
+graphql-core==3.2.3
+
 # Optional: Install these if you want Redis and PostgreSQL support
 # redis==5.0.1
 # psycopg2-binary==2.9.9

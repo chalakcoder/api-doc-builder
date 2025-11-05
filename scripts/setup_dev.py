@@ -35,7 +35,10 @@ def install_individual_packages(pip_cmd):
         "tenacity==8.2.3",
         "pyyaml==6.0.1",
         "markdown==3.5.1",
-        "pygments==2.17.2"
+        "pygments==2.17.2",
+        "jsonschema==4.20.0",
+        "openapi-spec-validator==0.7.1",
+        "graphql-core==3.2.3"
     ]
     
     # Optional dependencies (don't fail if these don't install)

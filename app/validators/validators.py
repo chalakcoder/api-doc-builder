@@ -180,3 +180,81 @@ class JSONSchemaValidator(BaseValidator):
                 is_valid=False,
                 errors=[f"JSON Schema validation failed: {e}"]
             )
+
+
+class SpecificationValidator:
+    """
+    Main validator that combines all format-specific validators.
+    
+    This class provides a unified interface for validating specifications
+    of different formats (OpenAPI, GraphQL, JSON Schema).
+    """
+    
+    def __init__(self):
+        """Initialize with all available validators."""
+        self.validators = {
+            SpecFormat.OPENAPI: OpenAPIValidator(),
+            SpecFormat.GRAPHQL: GraphQLValidator(),
+            SpecFormat.JSON_SCHEMA: JSONSchemaValidator(),
+        }
+    
+    def validate_specification(
+        self, 
+        content: str | Dict[str, Any], 
+        spec_format: SpecFormat
+    ) -> ValidationResult:
+        """
+        Validate specification content using the appropriate validator.
+        
+        Args:
+            content: Specification content (string or dict)
+            spec_format: Expected format of the specification
+            
+        Returns:
+            ValidationResult with validation status and details
+            
+        Raises:
+            ValidationError: If the format is not supported
+        """
+        if spec_format not in self.validators:
+            raise ValidationError(f"Unsupported specification format: {spec_format}")
+        
+        validator = self.validators[spec_format]
+        result = validator.validate(content)
+        
+        # Ensure the format is set in the result
+        if result.is_valid and result.format is None:
+            result.format = spec_format
+            
+        return result
+    
+    def auto_validate(self, content: str | Dict[str, Any]) -> ValidationResult:
+        """
+        Automatically detect format and validate specification.
+        
+        Args:
+            content: Specification content
+            
+        Returns:
+            ValidationResult with detected format and validation status
+        """
+        # Try each validator and return the first successful one
+        for spec_format, validator in self.validators.items():
+            try:
+                result = validator.validate(content)
+                if result.is_valid:
+                    result.format = spec_format
+                    return result
+            except Exception:
+                # Continue to next validator if this one fails
+                continue
+        
+        # If no validator succeeded, return a failure result
+        return ValidationResult(
+            is_valid=False,
+            errors=["Unable to validate as any supported format (OpenAPI, GraphQL, JSON Schema)"]
+        )
+    
+    def get_supported_formats(self) -> List[SpecFormat]:
+        """Get list of supported specification formats."""
+        return list(self.validators.keys())
