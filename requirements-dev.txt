@@ -1,0 +1,19 @@
+# Minimal requirements for development with SQLite and in-memory Redis
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+pydantic==2.5.0
+pydantic-settings==2.1.0
+aiohttp==3.9.1
+httpx==0.25.2
+python-multipart==0.0.6
+tenacity==8.2.3
+pyyaml==6.0.1
+markdown==3.5.1
+pygments==2.17.2
+
+# Optional: Install these if you want Redis and PostgreSQL support
+# redis==5.0.1
+# psycopg2-binary==2.9.9
+# celery==5.3.4

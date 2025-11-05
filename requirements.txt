@@ -1,0 +1,45 @@
+# Web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9  # PostgreSQL adapter (optional for SQLite)
+
+# Data validation and settings
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Async job processing
+celery==5.3.4
+redis==5.0.1
+
+# HTTP clients
+aiohttp==3.9.1
+httpx==0.25.2
+
+# File handling
+python-multipart==0.0.6
+
+# Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Retry logic
+tenacity==8.2.3
+
+# Configuration and parsing
+pyyaml==6.0.1
+
+# Documentation generation
+markdown==3.5.1
+pygments==2.17.2
+
+# Development dependencies (optional)
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-asyncio==0.21.1
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0
