@@ -127,173 +127,104 @@ async def rate_limit_check(request: Request):
     
     return rate_limit_info
 
-@router.post("/generate-docs", response_model=JobStatusResponse)
-async def generate_documentation(
+@router.post("/generate-docs/file", response_model=JobStatusResponse)
+async def generate_documentation_from_file(
     request: Request,
-    # File upload parameters
-    specification_file: Optional[UploadFile] = File(None),
+    specification_file: UploadFile = File(...),
     output_formats: Optional[str] = Form(None),
-    team_id: Optional[str] = Form(None),
-    service_name: Optional[str] = Form(None),
-    # JSON body (for non-file uploads)
-    json_request: Optional[SpecificationURLRequest | SpecificationJSONRequest] = None,
+    team_id: str = Form(...),
+    service_name: str = Form(...),
     _: None = Depends(rate_limit_check)
 ):
     """
-    Generate documentation from API specification.
-    
-    Supports three input methods:
-    1. File upload (multipart/form-data)
-    2. URL reference (JSON body with specification_url)
-    3. Direct JSON payload (JSON body with specification object)
+    Generate documentation from uploaded file.
     
     Requirements: 1.1, 1.4, 1.5
     """
-    with ErrorContext("generate_documentation", 
+    with ErrorContext("generate_documentation_from_file", 
                      method=request.method, 
                      path=str(request.url.path)):
         try:
-            # Determine input method and extract parameters
-            if specification_file:
-                # Method 1: File upload
-                if not all([team_id, service_name]):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="team_id and service_name are required for file uploads"
-                    )
-                
-                # Parse output formats from form data
-                formats = [OutputFormat.MARKDOWN]  # default
-                if output_formats:
-                    try:
-                        format_list = json.loads(output_formats)
+            # Parse output formats from form data
+            formats = [OutputFormat.MARKDOWN]  # default
+            if output_formats:
+                # Handle both JSON array and comma-separated string formats
+                try:
+                    # First try to parse as JSON array
+                    format_list = json.loads(output_formats)
+                    if isinstance(format_list, list):
                         formats = [OutputFormat(f) for f in format_list]
-                    except (json.JSONDecodeError, ValueError) as e:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Invalid output_formats: {e}"
-                        )
-                
-                # Read and validate file
-                if specification_file.size and specification_file.size > 10 * 1024 * 1024:  # 10MB limit
-                    raise ValidationError(
-                        message="File size exceeds 10MB limit",
-                        field="specification_file",
-                        details={"file_size": specification_file.size, "max_size": 10 * 1024 * 1024}
-                    )
-                
-                file_content = await specification_file.read()
-                
-                # Detect format and validate
-                format_detector = FormatDetector()
-                detected_format = format_detector.detect_format(
-                    content=file_content.decode('utf-8'),
-                    filename=specification_file.filename
-                )
-                
-                if not detected_format:
-                    raise SpecificationError(
-                        message="Unable to detect specification format. Supported formats: OpenAPI, GraphQL, JSON Schema",
-                        details={
-                            "filename": specification_file.filename,
-                            "supported_formats": ["OpenAPI", "GraphQL", "JSON Schema"]
-                        }
-                    )
-                
-                # Validate specification
-                validator = SpecificationValidator()
-                validation_result = validator.validate_specification(
-                    content=file_content.decode('utf-8'),
-                    spec_format=detected_format
-                )
-                
-                if not validation_result.is_valid:
-                    raise SpecificationError(
-                        message=f"Specification validation failed: {'; '.join(validation_result.errors)}",
-                        spec_format=detected_format.value,
-                        details={
-                            "validation_errors": validation_result.errors,
-                            "filename": specification_file.filename
-                        }
-                    )
-                
-                # Create job request
-                job_request = JobRequest(
-                    specification=file_content.decode('utf-8'),
-                    spec_format=detected_format,
-                    output_formats=formats,
-                    team_id=team_id,
-                    service_name=service_name
-                )
-            
-            elif json_request:
-                # Method 2 & 3: URL reference or direct JSON
-                if isinstance(json_request, SpecificationURLRequest):
-                    # Method 2: URL reference
+                    else:
+                        # Single format as string
+                        formats = [OutputFormat(format_list)]
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try comma-separated string
                     try:
-                        async with httpx.AsyncClient() as client:
-                            response = await client.get(json_request.specification_url, timeout=30.0)
-                            response.raise_for_status()
-                            spec_content = response.text
-                    except httpx.RequestError as e:
+                        format_strings = [f.strip() for f in output_formats.split(',')]
+                        formats = [OutputFormat(f) for f in format_strings if f]
+                    except ValueError as e:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Failed to fetch specification from URL: {e}"
+                            detail=f"Invalid output_formats. Expected JSON array like [\"markdown\", \"html\"] or comma-separated string like \"markdown,html\". Error: {e}"
                         )
-                    except httpx.HTTPStatusError as e:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"HTTP error fetching specification: {e.response.status_code}"
-                        )
-                    
-                    # Detect format
-                    format_detector = FormatDetector()
-                    detected_format = format_detector.detect_format(
-                        content=spec_content,
-                        url=json_request.specification_url
-                    )
-                    
-                    if not detected_format:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Unable to detect specification format from URL content"
-                        )
-                    
-                    specification = spec_content
-                    spec_format = detected_format
-                    
-                else:
-                    # Method 3: Direct JSON payload
-                    specification = json_request.specification
-                    spec_format = json_request.spec_format
-                
-                # Validate specification
-                validator = SpecificationValidator()
-                validation_result = validator.validate_specification(
-                    content=specification if isinstance(specification, str) else json.dumps(specification),
-                    spec_format=spec_format
-                )
-                
-                if not validation_result.is_valid:
+                except ValueError as e:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Specification validation failed: {'; '.join(validation_result.errors)}"
+                        detail=f"Invalid output format value: {e}"
                     )
-                
-                # Create job request
-                job_request = JobRequest(
-                    specification=specification,
-                    spec_format=spec_format,
-                    output_formats=json_request.output_formats,
-                    team_id=json_request.team_id,
-                    service_name=json_request.service_name
+            
+            # Rest of the function remains the same...
+            # Read and validate file
+            if specification_file.size and specification_file.size > 10 * 1024 * 1024:  # 10MB limit
+                raise ValidationError(
+                    message="File size exceeds 10MB limit",
+                    field="specification_file",
+                    details={"file_size": specification_file.size, "max_size": 10 * 1024 * 1024}
                 )
             
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No specification provided. Use file upload, URL reference, or direct JSON payload"
+            file_content = await specification_file.read()
+            
+            # Detect format and validate
+            format_detector = FormatDetector()
+            detected_format = format_detector.detect_format(
+                content=file_content.decode('utf-8'),
+                filename=specification_file.filename
+            )
+            
+            if not detected_format:
+                raise SpecificationError(
+                    message="Unable to detect specification format. Supported formats: OpenAPI, GraphQL, JSON Schema",
+                    details={
+                        "filename": specification_file.filename,
+                        "supported_formats": ["OpenAPI", "GraphQL", "JSON Schema"]
+                    }
                 )
+            
+            # Validate specification
+            validator = SpecificationValidator()
+            validation_result = validator.validate_specification(
+                content=file_content.decode('utf-8'),
+                spec_format=detected_format
+            )
+            
+            if not validation_result.is_valid:
+                raise SpecificationError(
+                    message=f"Specification validation failed: {'; '.join(validation_result.errors)}",
+                    spec_format=detected_format.value,
+                    details={
+                        "validation_errors": validation_result.errors,
+                        "filename": specification_file.filename
+                    }
+                )
+            
+            # Create job request
+            job_request = JobRequest(
+                specification=file_content.decode('utf-8'),
+                spec_format=detected_format,
+                output_formats=formats,
+                team_id=team_id,
+                service_name=service_name
+            )
             
             # Submit job
             job_result = await job_service.submit_documentation_job(job_request)
@@ -309,20 +240,171 @@ async def generate_documentation(
                 error_message=job_result.error_message
             )
             
-            logger.info(f"Documentation generation job {job_result.job_id} submitted successfully")
+            logger.info(f"Documentation generation job {job_result.job_id} submitted successfully from file")
             return response
             
         except (ValidationError, SpecificationError, JobProcessingError):
-            # Re-raise custom exceptions - they will be handled by global exception handler
             raise
         except HTTPException:
-            # Re-raise HTTP exceptions as-is
             raise
         except Exception as e:
-            logger.error(f"Unexpected error in generate_documentation: {e}", exc_info=True)
-            # Let the global exception handler deal with this
+            logger.error(f"Unexpected error in generate_documentation_from_file: {e}", exc_info=True)
             raise
 
+@router.post("/generate-docs/url", response_model=JobStatusResponse)
+async def generate_documentation_from_url(
+    request: Request,
+    json_request: SpecificationURLRequest,
+    _: None = Depends(rate_limit_check)
+):
+    """
+    Generate documentation from URL reference.
+    
+    Requirements: 1.1, 1.4, 1.5
+    """
+    with ErrorContext("generate_documentation_from_url", 
+                     method=request.method, 
+                     path=str(request.url.path)):
+        try:
+            # Fetch specification from URL
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(json_request.specification_url, timeout=30.0)
+                    response.raise_for_status()
+                    spec_content = response.text
+            except httpx.RequestError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to fetch specification from URL: {e}"
+                )
+            except httpx.HTTPStatusError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"HTTP error fetching specification: {e.response.status_code}"
+                )
+            
+            # Detect format
+            format_detector = FormatDetector()
+            detected_format = format_detector.detect_format(
+                content=spec_content,
+                url=json_request.specification_url
+            )
+            
+            if not detected_format:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unable to detect specification format from URL content"
+                )
+            
+            # Validate specification
+            validator = SpecificationValidator()
+            validation_result = validator.validate_specification(
+                content=spec_content,
+                spec_format=detected_format
+            )
+            
+            if not validation_result.is_valid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Specification validation failed: {'; '.join(validation_result.errors)}"
+                )
+            
+            # Create job request
+            job_request = JobRequest(
+                specification=spec_content,
+                spec_format=detected_format,
+                output_formats=json_request.output_formats,
+                team_id=json_request.team_id,
+                service_name=json_request.service_name
+            )
+            
+            # Submit job
+            job_result = await job_service.submit_documentation_job(job_request)
+            
+            # Convert to response model
+            response = JobStatusResponse(
+                job_id=str(job_result.job_id),
+                status=job_result.status.value,
+                created_at=job_result.created_at.isoformat(),
+                completed_at=job_result.completed_at.isoformat() if job_result.completed_at else None,
+                progress=job_result.progress.dict() if job_result.progress else None,
+                results=job_result.results,
+                error_message=job_result.error_message
+            )
+            
+            logger.info(f"Documentation generation job {job_result.job_id} submitted successfully from URL")
+            return response
+            
+        except (ValidationError, SpecificationError, JobProcessingError):
+            raise
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in generate_documentation_from_url: {e}", exc_info=True)
+            raise
+
+
+@router.post("/generate-docs/json", response_model=JobStatusResponse)
+async def generate_documentation_from_json(
+    request: Request,
+    json_request: SpecificationJSONRequest,
+    _: None = Depends(rate_limit_check)
+):
+    """
+    Generate documentation from direct JSON payload.
+    
+    Requirements: 1.1, 1.4, 1.5
+    """
+    with ErrorContext("generate_documentation_from_json", 
+                     method=request.method, 
+                     path=str(request.url.path)):
+        try:
+            # Validate specification
+            validator = SpecificationValidator()
+            validation_result = validator.validate_specification(
+                content=json.dumps(json_request.specification) if isinstance(json_request.specification, dict) else json_request.specification,
+                spec_format=json_request.spec_format
+            )
+            
+            if not validation_result.is_valid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Specification validation failed: {'; '.join(validation_result.errors)}"
+                )
+            
+            # Create job request
+            job_request = JobRequest(
+                specification=json_request.specification,
+                spec_format=json_request.spec_format,
+                output_formats=json_request.output_formats,
+                team_id=json_request.team_id,
+                service_name=json_request.service_name
+            )
+            
+            # Submit job
+            job_result = await job_service.submit_documentation_job(job_request)
+            
+            # Convert to response model
+            response = JobStatusResponse(
+                job_id=str(job_result.job_id),
+                status=job_result.status.value,
+                created_at=job_result.created_at.isoformat(),
+                completed_at=job_result.completed_at.isoformat() if job_result.completed_at else None,
+                progress=job_result.progress.dict() if job_result.progress else None,
+                results=job_result.results,
+                error_message=job_result.error_message
+            )
+            
+            logger.info(f"Documentation generation job {job_result.job_id} submitted successfully from JSON")
+            return response
+            
+        except (ValidationError, SpecificationError, JobProcessingError):
+            raise
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in generate_documentation_from_json: {e}", exc_info=True)
+            raise
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(
