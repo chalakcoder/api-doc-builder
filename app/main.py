@@ -11,7 +11,7 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.core.exceptions import setup_exception_handlers
 from app.api.endpoints import router as api_router
-from app.core.middleware import RateLimitMiddleware, LoggingMiddleware, SecurityHeadersMiddleware
+from app.core.middleware import CorrelationIDMiddleware, RateLimitMiddleware, EnhancedLoggingMiddleware, SecurityHeadersMiddleware
 from app.db.database import init_db, check_database_connection
 from app.jobs.celery_app import celery_app
 from app.services.genai_client import initialize_genai_client
@@ -57,6 +57,14 @@ async def lifespan(app: FastAPI):
         logger.info("Initializing format detector...")
         initialize_format_detector()
         logger.info("Format detector initialized successfully")
+        
+        # Initialize error pattern tracking
+        logger.info("Initializing error pattern tracking...")
+        from app.services.error_pattern_tracker import error_pattern_tracker
+        # Start periodic cleanup task
+        import asyncio
+        asyncio.create_task(error_pattern_tracker.periodic_cleanup())
+        logger.info("Error pattern tracking initialized successfully")
         
         # Start Celery worker monitoring (optional)
         logger.info("Celery app configured for job processing")
@@ -109,7 +117,8 @@ def create_app() -> FastAPI:
     # Add middleware (order matters - last added is executed first)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RateLimitMiddleware)
-    app.add_middleware(LoggingMiddleware)
+    app.add_middleware(EnhancedLoggingMiddleware)
+    app.add_middleware(CorrelationIDMiddleware)
     
     # Add CORS middleware
     app.add_middleware(

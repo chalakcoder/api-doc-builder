@@ -1,16 +1,78 @@
 """
-Custom middleware for the Spec Documentation API.
+Enhanced middleware for the Spec Documentation API with structured logging.
 """
 import time
-import logging
+import uuid
 from typing import Callable
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.rate_limiter import rate_limiter
+from app.core.logging import (
+    get_logger, 
+    set_correlation_id, 
+    set_request_context, 
+    generate_correlation_id,
+    PerformanceLogger
+)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+performance_logger = PerformanceLogger()
+
+
+class CorrelationIDMiddleware(BaseHTTPMiddleware):
+    """
+    Enhanced middleware to add correlation IDs to requests for tracing.
+    
+    This middleware ensures every request has a correlation ID for
+    better debugging and request tracing across services, and sets
+    up the logging context.
+    """
+    
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Add correlation ID to request and response headers, set up logging context."""
+        
+        # Get correlation ID from request headers or generate new one
+        correlation_id = request.headers.get("x-correlation-id")
+        if not correlation_id:
+            correlation_id = generate_correlation_id()
+        
+        # Set correlation ID in context for logging
+        set_correlation_id(correlation_id)
+        
+        # Add correlation ID to request state for access in handlers
+        request.state.correlation_id = correlation_id
+        
+        # Set up request context for logging
+        request_context = {
+            "method": request.method,
+            "path": str(request.url.path),
+            "query_params": dict(request.query_params),
+            "client_host": request.client.host if request.client else None,
+            "user_agent": request.headers.get("user-agent"),
+            "content_type": request.headers.get("content-type"),
+            "correlation_id": correlation_id
+        }
+        set_request_context(request_context)
+        
+        # Log request initiation
+        logger.info(
+            "Request initiated",
+            method=request.method,
+            path=str(request.url.path),
+            client_host=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent", "")[:100]  # Truncate long user agents
+        )
+        
+        # Process the request
+        response = await call_next(request)
+        
+        # Add correlation ID to response headers
+        if isinstance(response, (Response, JSONResponse)):
+            response.headers["X-Correlation-ID"] = correlation_id
+        
+        return response
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -49,49 +111,93 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
 
-class LoggingMiddleware(BaseHTTPMiddleware):
+class EnhancedLoggingMiddleware(BaseHTTPMiddleware):
     """
-    Middleware for request/response logging.
+    Enhanced middleware for request/response logging with structured logging and performance metrics.
     """
     
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """Log request and response information."""
+        """Log request and response information with enhanced context and performance tracking."""
         
         start_time = time.time()
         
-        # Log request
-        logger.info(
-            f"Request: {request.method} {request.url.path} "
-            f"from {request.client.host if request.client else 'unknown'}"
-        )
+        # Get correlation ID from request state (set by CorrelationIDMiddleware)
+        correlation_id = getattr(request.state, 'correlation_id', 'unknown')
+        
+        # Skip detailed logging for health check endpoints to reduce noise
+        is_health_check = request.url.path in ["/health", "/api/v1/health", "/api/v1/health/detailed"]
+        
+        if not is_health_check:
+            # Log request start with structured data
+            logger.info(
+                "Request started",
+                method=request.method,
+                path=str(request.url.path),
+                query_params=dict(request.query_params) if request.query_params else None,
+                content_length=request.headers.get("content-length"),
+                content_type=request.headers.get("content-type")
+            )
         
         try:
             # Process request
             response = await call_next(request)
             
             # Calculate processing time
-            process_time = time.time() - start_time
+            process_time_ms = (time.time() - start_time) * 1000
             
-            # Log response
-            logger.info(
-                f"Response: {response.status_code} "
-                f"for {request.method} {request.url.path} "
-                f"in {process_time:.3f}s"
-            )
+            if not is_health_check:
+                # Log successful response with performance metrics
+                logger.info(
+                    "Request completed",
+                    status_code=response.status_code,
+                    duration_ms=round(process_time_ms, 2),
+                    response_size=response.headers.get("content-length")
+                )
+                
+                # Log performance metrics
+                performance_logger.log_request_performance(
+                    method=request.method,
+                    path=str(request.url.path),
+                    status_code=response.status_code,
+                    duration_ms=round(process_time_ms, 2),
+                    content_length=request.headers.get("content-length"),
+                    response_size=response.headers.get("content-length")
+                )
             
-            # Add processing time header
+            # Add processing time headers
             if isinstance(response, (Response, JSONResponse)):
-                response.headers["X-Process-Time"] = str(process_time)
+                response.headers["X-Process-Time"] = str(round(process_time_ms, 2))
+                response.headers["X-Correlation-ID"] = correlation_id
             
             return response
             
         except Exception as e:
-            process_time = time.time() - start_time
+            process_time_ms = (time.time() - start_time) * 1000
+            
+            # Log request failure with detailed error context
             logger.error(
-                f"Request failed: {request.method} {request.url.path} "
-                f"after {process_time:.3f}s - {str(e)}"
+                "Request failed",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                duration_ms=round(process_time_ms, 2),
+                exc_info=True
             )
+            
+            # Log performance metrics for failed requests
+            performance_logger.log_request_performance(
+                method=request.method,
+                path=str(request.url.path),
+                status_code=500,  # Assume 500 for unhandled exceptions
+                duration_ms=round(process_time_ms, 2),
+                error=str(e),
+                success=False
+            )
+            
             raise
+
+
+# Backward compatibility alias
+LoggingMiddleware = EnhancedLoggingMiddleware
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):

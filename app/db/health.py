@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.db.database import get_db_session, engine
+from app.db.database import get_db_session, engine, health_monitor, get_comprehensive_database_status
 from app.db.models import DocumentationJob, QualityScoreDB
 
 logger = logging.getLogger(__name__)
@@ -144,34 +144,42 @@ class DatabaseHealthChecker:
     
     def get_comprehensive_health(self) -> Dict[str, Any]:
         """
-        Get comprehensive database health report.
+        Get comprehensive database health report combining legacy and new monitoring.
         
         Returns:
             Complete health status dictionary
         """
+        # Get enhanced database status from new monitoring system
+        enhanced_status = get_comprehensive_database_status()
+        
+        # Get legacy health checks for backward compatibility
         connection_health = self.check_connection()
         tables_health = self.check_tables()
         performance_health = self.check_performance()
         
-        # Determine overall status
-        statuses = [
+        # Combine legacy status determination with enhanced monitoring
+        legacy_statuses = [
             connection_health.get("status"),
             tables_health.get("status"),
             performance_health.get("status")
         ]
         
-        if all(status == "healthy" for status in statuses):
-            overall_status = "healthy"
-        elif any(status == "unhealthy" for status in statuses):
-            overall_status = "unhealthy"
+        if all(status == "healthy" for status in legacy_statuses):
+            legacy_overall_status = "healthy"
+        elif any(status == "unhealthy" for status in legacy_statuses):
+            legacy_overall_status = "unhealthy"
         else:
-            overall_status = "degraded"
+            legacy_overall_status = "degraded"
         
+        # Combine enhanced and legacy health information
         return {
-            "overall_status": overall_status,
-            "connection": connection_health,
-            "tables": tables_health,
-            "performance": performance_health,
+            "overall_status": legacy_overall_status,
+            "enhanced_monitoring": enhanced_status,
+            "legacy_checks": {
+                "connection": connection_health,
+                "tables": tables_health,
+                "performance": performance_health
+            },
             "timestamp": datetime.utcnow().isoformat()
         }
 

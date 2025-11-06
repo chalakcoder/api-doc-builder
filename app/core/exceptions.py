@@ -1,15 +1,65 @@
 """
-Custom exceptions and global error handling for the Spec Documentation API.
+Enhanced exceptions and global error handling for the Spec Documentation API.
 """
-import logging
-from typing import Dict, Any, Optional
+import uuid
+from datetime import datetime
+from typing import Dict, Any, Optional, List
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from pydantic import BaseModel
 import traceback
 
-logger = logging.getLogger(__name__)
+from app.core.logging import get_logger, get_correlation_id
+from app.services.error_pattern_tracker import track_error_pattern
+
+logger = get_logger(__name__)
+
+
+# Enhanced error response models
+class ErrorDetails(BaseModel):
+    """Detailed error information model."""
+    message: str
+    code: str
+    type: str
+    details: Optional[Dict[str, Any]] = None
+    field: Optional[str] = None  # For validation errors
+    retry_after: Optional[int] = None  # For rate limit errors
+    correlation_id: Optional[str] = None
+
+
+class StandardErrorResponse(BaseModel):
+    """Standardized error response format."""
+    error: ErrorDetails
+    request_id: str
+    timestamp: datetime
+    path: Optional[str] = None
+    method: Optional[str] = None
+
+
+class ValidationErrorDetail(BaseModel):
+    """Detailed validation error information."""
+    field: str
+    message: str
+    type: str
+    input: Optional[Any] = None
+
+
+class FieldValidationError(BaseModel):
+    """Field-level validation error details."""
+    field: str
+    errors: List[ValidationErrorDetail]
+
+
+class EnhancedValidationErrorResponse(BaseModel):
+    """Enhanced validation error response with field-level details."""
+    error: ErrorDetails
+    request_id: str
+    timestamp: datetime
+    path: Optional[str] = None
+    method: Optional[str] = None
+    field_errors: List[FieldValidationError] = []
 
 
 class SpecDocumentationAPIError(Exception):
@@ -78,169 +128,395 @@ class ConfigurationError(SpecDocumentationAPIError):
         self.config_key = config_key
 
 
+# Utility functions for error handling
+def generate_correlation_id() -> str:
+    """Generate a unique correlation ID for request tracing."""
+    return str(uuid.uuid4())
+
+
+def sanitize_error_details(details: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sanitize error details to prevent sensitive data leakage.
+    
+    Args:
+        details: Raw error details dictionary
+        
+    Returns:
+        Sanitized error details
+    """
+    if not details:
+        return {}
+    
+    # List of sensitive keys to remove or mask
+    sensitive_keys = {
+        'password', 'token', 'secret', 'key', 'auth', 'authorization',
+        'api_key', 'access_token', 'refresh_token', 'session_id',
+        'cookie', 'x-api-key', 'bearer'
+    }
+    
+    sanitized = {}
+    for key, value in details.items():
+        key_lower = key.lower()
+        
+        # Check if key contains sensitive information
+        if any(sensitive in key_lower for sensitive in sensitive_keys):
+            sanitized[key] = "[REDACTED]"
+        elif isinstance(value, dict):
+            # Recursively sanitize nested dictionaries
+            sanitized[key] = sanitize_error_details(value)
+        elif isinstance(value, str) and len(value) > 500:
+            # Truncate very long strings to prevent log flooding
+            sanitized[key] = value[:500] + "... [TRUNCATED]"
+        else:
+            sanitized[key] = value
+    
+    return sanitized
+
+
+def get_request_context(request: Request) -> Dict[str, Any]:
+    """
+    Extract relevant context information from request.
+    
+    Args:
+        request: FastAPI request object
+        
+    Returns:
+        Dictionary containing request context
+    """
+    context = {
+        "method": request.method,
+        "path": str(request.url.path),
+        "query_params": dict(request.query_params),
+        "client_host": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent"),
+        "content_type": request.headers.get("content-type")
+    }
+    
+    # Add correlation ID if present in headers
+    correlation_id = request.headers.get("x-correlation-id")
+    if correlation_id:
+        context["correlation_id"] = correlation_id
+    
+    return context
+
+
 def create_error_response(
     error: Exception,
     status_code: int = 500,
-    include_traceback: bool = False
+    include_traceback: bool = False,
+    request: Optional[Request] = None,
+    correlation_id: Optional[str] = None
 ) -> JSONResponse:
     """
-    Create standardized error response.
+    Create standardized error response with enhanced context.
     
     Args:
         error: Exception that occurred
         status_code: HTTP status code
         include_traceback: Whether to include traceback in response
+        request: FastAPI request object for context
+        correlation_id: Optional correlation ID for tracing
         
     Returns:
-        JSONResponse with error details
+        JSONResponse with standardized error details
     """
-    error_data = {
-        "error": {
-            "message": str(error),
-            "type": type(error).__name__,
-            "timestamp": logger.handlers[0].formatter.formatTime(
-                logging.LogRecord("", 0, "", 0, "", (), None)
-            ) if logger.handlers else None
-        }
-    }
+    # Generate correlation ID if not provided
+    if not correlation_id:
+        correlation_id = generate_correlation_id()
+    
+    # Get request context if available
+    request_context = get_request_context(request) if request else {}
+    
+    # Create error details
+    error_details = ErrorDetails(
+        message=str(error),
+        code="GENERAL_ERROR",
+        type=type(error).__name__,
+        correlation_id=correlation_id
+    )
     
     # Add specific error details for custom exceptions
     if isinstance(error, SpecDocumentationAPIError):
-        error_data["error"]["code"] = error.error_code
-        error_data["error"]["details"] = error.details
+        error_details.code = error.error_code
+        error_details.details = sanitize_error_details(error.details) if error.details else None
         
         # Add field-specific information for validation errors
         if isinstance(error, ValidationError) and error.field:
-            error_data["error"]["field"] = error.field
-            
-        # Add job ID for job processing errors
-        if isinstance(error, JobProcessingError) and error.job_id:
-            error_data["error"]["job_id"] = error.job_id
+            error_details.field = error.field
             
         # Add retry information for rate limit errors
         if isinstance(error, RateLimitError) and error.retry_after:
-            error_data["error"]["retry_after"] = error.retry_after
+            error_details.retry_after = error.retry_after
+    
+    # Create standardized response
+    response_data = StandardErrorResponse(
+        error=error_details,
+        request_id=correlation_id,
+        timestamp=datetime.utcnow(),
+        path=request_context.get("path"),
+        method=request_context.get("method")
+    )
     
     # Add traceback for debugging (only in development)
     if include_traceback:
-        error_data["error"]["traceback"] = traceback.format_exc()
+        if not response_data.error.details:
+            response_data.error.details = {}
+        response_data.error.details["traceback"] = traceback.format_exc()
     
-    # Add request ID if available (would be set by middleware)
-    # This helps with debugging and support
-    error_data["error"]["request_id"] = getattr(error, "request_id", None)
+    # Set response headers for correlation tracking
+    headers = {
+        "X-Correlation-ID": correlation_id,
+        "X-Error-Code": error_details.code
+    }
+    
+    # Add retry-after header for rate limit errors
+    if isinstance(error, RateLimitError) and error.retry_after:
+        headers["Retry-After"] = str(error.retry_after)
     
     return JSONResponse(
         status_code=status_code,
-        content=error_data
+        content=response_data.dict(),
+        headers=headers
     )
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """
-    Handle FastAPI validation errors.
+    Handle FastAPI validation errors with enhanced field-level details and error tracking.
     
     Args:
         request: FastAPI request object
         exc: Validation exception
         
     Returns:
-        JSONResponse with validation error details
+        JSONResponse with detailed validation error information
     """
-    logger.warning(
-        f"Validation error on {request.method} {request.url.path}",
-        extra={
-            "errors": exc.errors(),
-            "body": exc.body if hasattr(exc, 'body') else None
+    # Get correlation ID from context or generate new one
+    correlation_id = get_correlation_id() or request.headers.get("x-correlation-id") or generate_correlation_id()
+    
+    # Track error pattern
+    track_error_pattern(
+        error_type="RequestValidationError",
+        endpoint=str(request.url.path),
+        error_code="VALIDATION_ERROR",
+        correlation_id=correlation_id,
+        additional_context={
+            "method": request.method,
+            "error_count": len(exc.errors()),
+            "client_host": request.client.host if request.client else None
         }
     )
     
-    # Format validation errors in a user-friendly way
-    formatted_errors = []
+    # Log validation error with structured logging
+    logger.warning(
+        "Request validation failed",
+        error_count=len(exc.errors()),
+        errors=exc.errors(),
+        body_present=hasattr(exc, 'body') and exc.body is not None,
+        method=request.method,
+        path=str(request.url.path)
+    )
+    
+    # Group validation errors by field for better organization
+    field_errors = {}
     for error in exc.errors():
         field_path = " -> ".join(str(loc) for loc in error["loc"])
-        formatted_errors.append({
-            "field": field_path,
-            "message": error["msg"],
-            "type": error["type"],
-            "input": error.get("input")
-        })
+        
+        if field_path not in field_errors:
+            field_errors[field_path] = []
+        
+        field_errors[field_path].append(ValidationErrorDetail(
+            field=field_path,
+            message=error["msg"],
+            type=error["type"],
+            input=error.get("input")
+        ))
     
-    error_response = {
-        "error": {
-            "message": "Request validation failed",
-            "code": "VALIDATION_ERROR",
-            "type": "RequestValidationError",
-            "details": {
-                "validation_errors": formatted_errors
-            },
-            "timestamp": logger.handlers[0].formatter.formatTime(
-                logging.LogRecord("", 0, "", 0, "", (), None)
-            ) if logger.handlers else None
+    # Create field validation errors list
+    field_validation_errors = [
+        FieldValidationError(field=field, errors=errors)
+        for field, errors in field_errors.items()
+    ]
+    
+    # Create error details
+    error_details = ErrorDetails(
+        message="Request validation failed",
+        code="VALIDATION_ERROR",
+        type="RequestValidationError",
+        correlation_id=correlation_id,
+        details={
+            "total_errors": len(exc.errors()),
+            "fields_with_errors": list(field_errors.keys())
         }
+    )
+    
+    # Create enhanced validation error response
+    response_data = EnhancedValidationErrorResponse(
+        error=error_details,
+        request_id=correlation_id,
+        timestamp=datetime.utcnow(),
+        path=str(request.url.path),
+        method=request.method,
+        field_errors=field_validation_errors
+    )
+    
+    # Set response headers
+    headers = {
+        "X-Correlation-ID": correlation_id,
+        "X-Error-Code": "VALIDATION_ERROR",
+        "X-Validation-Errors": str(len(exc.errors()))
     }
     
     return JSONResponse(
         status_code=422,
-        content=error_response
+        content=response_data.dict(),
+        headers=headers
     )
 
 
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     """
-    Handle HTTP exceptions.
+    Handle HTTP exceptions with enhanced context, correlation tracking, and error pattern analysis.
     
     Args:
         request: FastAPI request object
         exc: HTTP exception
         
     Returns:
-        JSONResponse with HTTP error details
+        JSONResponse with standardized HTTP error details
     """
-    logger.warning(
-        f"HTTP {exc.status_code} error on {request.method} {request.url.path}: {exc.detail}"
+    # Get correlation ID from context or generate new one
+    correlation_id = get_correlation_id() or request.headers.get("x-correlation-id") or generate_correlation_id()
+    
+    # Track error pattern
+    track_error_pattern(
+        error_type="HTTPException",
+        endpoint=str(request.url.path),
+        error_code=f"HTTP_{exc.status_code}",
+        correlation_id=correlation_id,
+        additional_context={
+            "method": request.method,
+            "status_code": exc.status_code,
+            "detail": str(exc.detail)[:200],  # Truncate long details
+            "client_host": request.client.host if request.client else None
+        }
     )
     
-    error_response = {
-        "error": {
-            "message": exc.detail,
-            "code": f"HTTP_{exc.status_code}",
-            "type": "HTTPException",
-            "timestamp": logger.handlers[0].formatter.formatTime(
-                logging.LogRecord("", 0, "", 0, "", (), None)
-            ) if logger.handlers else None
+    # Log HTTP error with structured logging
+    logger.warning(
+        "HTTP exception occurred",
+        status_code=exc.status_code,
+        detail=exc.detail,
+        method=request.method,
+        path=str(request.url.path),
+        user_agent=request.headers.get("user-agent", "")[:100]  # Truncate long user agents
+    )
+    
+    # Create error details with retry guidance for specific status codes
+    error_details = ErrorDetails(
+        message=exc.detail,
+        code=f"HTTP_{exc.status_code}",
+        type="HTTPException",
+        correlation_id=correlation_id
+    )
+    
+    # Add retry guidance for specific error types
+    if exc.status_code == 429:  # Too Many Requests
+        error_details.retry_after = 60  # Default retry after 60 seconds
+        error_details.details = {
+            "retry_guidance": "Request rate limit exceeded. Please wait before retrying.",
+            "suggested_action": "Implement exponential backoff in your client"
         }
+    elif exc.status_code == 503:  # Service Unavailable
+        error_details.retry_after = 30
+        error_details.details = {
+            "retry_guidance": "Service temporarily unavailable. Please retry after a short delay.",
+            "suggested_action": "Check system status and retry with exponential backoff"
+        }
+    elif exc.status_code == 502:  # Bad Gateway
+        error_details.details = {
+            "retry_guidance": "Upstream service error. This may be temporary.",
+            "suggested_action": "Retry the request after a brief delay"
+        }
+    
+    # Create standardized response
+    response_data = StandardErrorResponse(
+        error=error_details,
+        request_id=correlation_id,
+        timestamp=datetime.utcnow(),
+        path=str(request.url.path),
+        method=request.method
+    )
+    
+    # Set response headers
+    headers = {
+        "X-Correlation-ID": correlation_id,
+        "X-Error-Code": error_details.code
     }
+    
+    # Add retry-after header for rate limiting and service unavailable
+    if error_details.retry_after:
+        headers["Retry-After"] = str(error_details.retry_after)
     
     return JSONResponse(
         status_code=exc.status_code,
-        content=error_response
+        content=response_data.dict(),
+        headers=headers
     )
 
 
 async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """
-    Handle all other exceptions.
+    Handle all other exceptions with enhanced logging, context, and error pattern tracking.
     
     Args:
         request: FastAPI request object
         exc: Exception that occurred
         
     Returns:
-        JSONResponse with error details
+        JSONResponse with standardized error details
     """
-    # Log the full exception with traceback
-    logger.error(
-        f"Unhandled exception on {request.method} {request.url.path}",
-        exc_info=True,
-        extra={
-            "exception_type": type(exc).__name__,
-            "exception_message": str(exc)
+    # Get correlation ID from context or generate new one
+    correlation_id = get_correlation_id() or request.headers.get("x-correlation-id") or generate_correlation_id()
+    
+    # Get request context for logging
+    request_context = get_request_context(request)
+    
+    # Determine error code for tracking
+    error_code = "GENERAL_ERROR"
+    if isinstance(exc, SpecDocumentationAPIError):
+        error_code = exc.error_code
+    
+    # Track error pattern
+    track_error_pattern(
+        error_type=type(exc).__name__,
+        endpoint=str(request.url.path),
+        error_code=error_code,
+        correlation_id=correlation_id,
+        additional_context={
+            "method": request.method,
+            "exception_message": str(exc)[:200],  # Truncate long messages
+            "client_host": request.client.host if request.client else None
         }
     )
     
+    # Log the full exception with enhanced structured logging
+    logger.error(
+        "Unhandled exception occurred",
+        exception_type=type(exc).__name__,
+        exception_message=str(exc),
+        method=request.method,
+        path=str(request.url.path),
+        request_context=sanitize_error_details(request_context),
+        exc_info=True
+    )
+    
     # Determine if we should include traceback (only in development)
-    from app.core.config import settings
-    include_traceback = settings.DEBUG
+    try:
+        from app.core.config import settings
+        include_traceback = getattr(settings, 'DEBUG', False)
+    except ImportError:
+        include_traceback = False
     
     # Create appropriate status code based on exception type
     status_code = 500
@@ -261,7 +537,9 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
     return create_error_response(
         error=exc,
         status_code=status_code,
-        include_traceback=include_traceback
+        include_traceback=include_traceback,
+        request=request,
+        correlation_id=correlation_id
     )
 
 
